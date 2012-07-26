@@ -97,6 +97,8 @@
          tmpdir/0, tmpdir/1, mktemp/1, split_at/2,
          id_dir/1, ctl_file/1]).
 
+-export([parse_ipmask/1, match_ipmask/2]).
+
 
 start() ->
     application:start(yaws, permanent).
@@ -2215,3 +2217,147 @@ split_at([H|T], Char, Ack) ->
     split_at(T, Char, [H|Ack]);
 split_at([], _Char, Ack) ->
     {lists:reverse(Ack), []}.
+
+
+%% Parse an Ip address or an Ip address range
+%% Return Ip || {IpMin, IpMax} where:
+%%     Ip, IpMin, IpMax ::= ip_address()
+parse_ipmask(Str) when is_list(Str) ->
+    case string:tokens(Str, [$/]) of
+        [IpStr] ->
+            case inet_parse:address(IpStr) of
+                {ok, Ip}        -> Ip;
+                {error, Reason} -> throw({error, Reason})
+            end;
+        [IpStr, NetMask] ->
+            {Type, IpInt} = ip_to_integer(IpStr),
+            MaskInt       = netmask_to_integer(Type, NetMask),
+            case netmask_to_wildcard(Type, MaskInt) of
+                0 ->
+                    integer_to_ip(Type, IpInt);
+                Wildcard when Type =:= ipv4 ->
+                    NetAddr   = (IpInt band MaskInt),
+                    Broadcast = NetAddr + Wildcard,
+                    IpMin     = NetAddr + 1,
+                    IpMax     = Broadcast - 1,
+                    {integer_to_ip(ipv4, IpMin), integer_to_ip(ipv4, IpMax)};
+                Wildcard when Type =:= ipv6 ->
+                    NetAddr   = (IpInt band MaskInt),
+                    IpMin = NetAddr,
+                    IpMax = NetAddr + Wildcard,
+                    {integer_to_ip(ipv6, IpMin), integer_to_ip(ipv6, IpMax)}
+            end;
+        _ ->
+            throw({error, einval})
+    end;
+parse_ipmask(_) ->
+    throw({error, einval}).
+
+
+-define(MAXBITS_IPV4, 32).
+-define(MASK_IPV4,    16#FFFFFFFF).
+-define(MAXBITS_IPV6, 128).
+-define(MASK_IPV6,    16#FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF).
+
+ip_to_integer(Str) when is_list(Str) ->
+    case inet_parse:address(Str) of
+        {ok, Ip}        -> ip_to_integer(Ip);
+        {error, Reason} -> throw({error, Reason})
+    end;
+ip_to_integer({N1,N2,N3,N4}) ->
+    Int = (N1 bsl 24) bor (N2 bsl 16) bor (N3 bsl 8) bor N4,
+    if
+        (Int bsr ?MAXBITS_IPV4) == 0 -> {ipv4, Int};
+        true -> throw({error, einval})
+    end;
+ip_to_integer({N1,N2,N3,N4,N5,N6,N7,N8}) ->
+    Int = (N1 bsl 112) bor (N2 bsl 96) bor (N3 bsl 80) bor (N4 bsl 64) bor
+        (N5 bsl 48) bor (N6 bsl 32) bor (N7 bsl 16) bor N8,
+    if
+        (Int bsr ?MAXBITS_IPV6) == 0 -> {ipv6, Int};
+        true -> throw({error, einval})
+    end;
+ip_to_integer(_) ->
+    throw({error, einval}).
+
+integer_to_ip(ipv4, I) when is_integer(I), I =< ?MASK_IPV4 ->
+    N1 =  I bsr 24,
+    N2 = (I band ((1 bsl 24) - 1)) bsr 16,
+    N3 = (I band ((1 bsl 16) - 1)) bsr 8,
+    N4 = (I band ((1 bsl 8) - 1)),
+    {N1, N2, N3, N4};
+integer_to_ip(ipv6, I) when is_integer(I), I =< ?MASK_IPV6 ->
+    N1 =  I bsr 112,
+    N2 = (I band ((1 bsl 112) - 1)) bsr 96,
+    N3 = (I band ((1 bsl  96) - 1)) bsr 80,
+    N4 = (I band ((1 bsl  80) - 1)) bsr 64,
+    N5 = (I band ((1 bsl  64) - 1)) bsr 48,
+    N6 = (I band ((1 bsl  48) - 1)) bsr 32,
+    N7 = (I band ((1 bsl  32) - 1)) bsr 16,
+    N8 = (I band ((1 bsl  16) - 1)),
+    {N1, N2, N3, N4, N5, N6, N7, N8};
+integer_to_ip(_, _) ->
+    throw({error, einval}).
+
+netmask_to_integer(Type, NetMask) ->
+    case catch list_to_integer(NetMask) of
+        I when is_integer(I) ->
+            case Type of
+                ipv4 -> (1 bsl ?MAXBITS_IPV4) - (1 bsl (?MAXBITS_IPV4 - I));
+                ipv6 -> (1 bsl ?MAXBITS_IPV6) - (1 bsl (?MAXBITS_IPV6 - I))
+            end;
+        _ ->
+            case ip_to_integer(NetMask) of
+                {Type, MaskInt} -> MaskInt;
+                _               -> throw({error, einval})
+            end
+    end.
+
+netmask_to_wildcard(ipv4, Mask) -> ((1 bsl ?MAXBITS_IPV4) - 1) bxor Mask;
+netmask_to_wildcard(ipv6, Mask) -> ((1 bsl ?MAXBITS_IPV6) - 1) bxor Mask.
+
+
+%% Compare an ip to another ip or a range of ips
+match_ipmask(Ip, Ip) ->
+    true;
+match_ipmask(Ip, {IpMin, IpMax}) ->
+    case compare_ips(Ip, IpMin) of
+        error -> false;
+        less  -> false;
+        _ ->
+            case compare_ips(Ip, IpMax) of
+                error   -> false;
+                greater -> false;
+                _       -> true
+            end
+    end;
+match_ipmask(_, _) ->
+    false.
+
+compare_ips({A,B,C,D},          {A,B,C,D})                       -> equal;
+compare_ips({A,B,C,D,E,F,G,H},  {A,B,C,D,E,F,G,H})               -> equal;
+compare_ips({A,B,C,D1},         {A,B,C,D2})         when D1 < D2 -> less;
+compare_ips({A,B,C,D1},         {A,B,C,D2})         when D1 > D2 -> greater;
+compare_ips({A,B,C1,_},         {A,B,C2,_})         when C1 < C2 -> less;
+compare_ips({A,B,C1,_},         {A,B,C2,_})         when C1 > C2 -> greater;
+compare_ips({A,B1,_,_},         {A,B2,_,_})         when B1 < B2 -> less;
+compare_ips({A,B1,_,_},         {A,B2,_,_})         when B1 > B2 -> greater;
+compare_ips({A1,_,_,_},         {A2,_,_,_})         when A1 < A2 -> less;
+compare_ips({A1,_,_,_},         {A2,_,_,_})         when A1 > A2 -> greater;
+compare_ips({A,B,C,D,E,F,G,H1}, {A,B,C,D,E,F,G,H2}) when H1 < H2 -> less;
+compare_ips({A,B,C,D,E,F,G,H1}, {A,B,C,D,E,F,G,H2}) when H1 > H2 -> greater;
+compare_ips({A,B,C,D,E,F,G1,_}, {A,B,C,D,E,F,G2,_}) when G1 < G2 -> less;
+compare_ips({A,B,C,D,E,F,G1,_}, {A,B,C,D,E,F,G2,_}) when G1 > G2 -> greater;
+compare_ips({A,B,C,D,E,F1,_,_}, {A,B,C,D,E,F2,_,_}) when F1 < F2 -> less;
+compare_ips({A,B,C,D,E,F1,_,_}, {A,B,C,D,E,F2,_,_}) when F1 > F2 -> greater;
+compare_ips({A,B,C,D,E1,_,_,_}, {A,B,C,D,E2,_,_,_}) when E1 < E2 -> less;
+compare_ips({A,B,C,D,E1,_,_,_}, {A,B,C,D,E2,_,_,_}) when E1 > E2 -> greater;
+compare_ips({A,B,C,D1,_,_,_,_}, {A,B,C,D2,_,_,_,_}) when D1 < D2 -> less;
+compare_ips({A,B,C,D1,_,_,_,_}, {A,B,C,D2,_,_,_,_}) when D1 > D2 -> greater;
+compare_ips({A,B,C1,_,_,_,_,_}, {A,B,C2,_,_,_,_,_}) when C1 < C2 -> less;
+compare_ips({A,B,C1,_,_,_,_,_}, {A,B,C2,_,_,_,_,_}) when C1 > C2 -> greater;
+compare_ips({A,B1,_,_,_,_,_,_}, {A,B2,_,_,_,_,_,_}) when B1 < B2 -> less;
+compare_ips({A,B1,_,_,_,_,_,_}, {A,B2,_,_,_,_,_,_}) when B1 > B2 -> greater;
+compare_ips({A1,_,_,_,_,_,_,_}, {A2,_,_,_,_,_,_,_}) when A1 < A2 -> less;
+compare_ips({A1,_,_,_,_,_,_,_}, {A2,_,_,_,_,_,_,_}) when A1 > A2 -> greater;
+compare_ips(_,                  _)                               -> error.
